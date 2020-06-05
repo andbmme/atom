@@ -7,11 +7,13 @@ fs = require 'fs-plus'
 Grim = require 'grim'
 pathwatcher = require 'pathwatcher'
 FindParentDir = require 'find-parent-dir'
+{CompositeDisposable} = require 'event-kit'
 
 TextEditor = require '../src/text-editor'
 TextEditorElement = require '../src/text-editor-element'
-TokenizedBuffer = require '../src/tokenized-buffer'
-clipboard = require '../src/safe-clipboard'
+TextMateLanguageMode = require '../src/text-mate-language-mode'
+TreeSitterLanguageMode = require '../src/tree-sitter-language-mode'
+{clipboard} = require 'electron'
 
 jasmineStyle = document.createElement('style')
 jasmineStyle.textContent = atom.themes.loadStylesheet(atom.themes.resolveStylesheet('../static/jasmine'))
@@ -42,7 +44,13 @@ Set.prototype.isEqual = (other) ->
   else
     false
 
-jasmine.getEnv().addEqualityTester(_.isEqual) # Use underscore's definition of equality for toEqual assertions
+jasmine.getEnv().addEqualityTester (a, b) ->
+  # Match jasmine.any's equality matching logic
+  return a.jasmineMatches(b) if a?.jasmineMatches?
+  return b.jasmineMatches(a) if b?.jasmineMatches?
+  
+  # Use underscore's definition of equality for toEqual assertions
+  _.isEqual(a, b)
 
 if process.env.CI
   jasmine.getEnv().defaultTimeoutInterval = 60000
@@ -61,6 +69,9 @@ else
   specProjectPath = require('os').tmpdir()
 
 beforeEach ->
+  # Do not clobber recent project history
+  spyOn(Object.getPrototypeOf(atom.history), 'saveState').andReturn(Promise.resolve())
+
   atom.project.setPaths([specProjectPath])
 
   window.resetTimeouts()
@@ -96,8 +107,22 @@ beforeEach ->
   spyOn(TextEditor.prototype, "shouldPromptToSave").andReturn false
 
   # make tokenization synchronous
-  TokenizedBuffer.prototype.chunkSize = Infinity
-  spyOn(TokenizedBuffer.prototype, "tokenizeInBackground").andCallFake -> @tokenizeNextChunk()
+  TextMateLanguageMode.prototype.chunkSize = Infinity
+  TreeSitterLanguageMode.prototype.syncTimeoutMicros = Infinity
+  spyOn(TextMateLanguageMode.prototype, "tokenizeInBackground").andCallFake -> @tokenizeNextChunk()
+
+  # Without this spy, TextEditor.onDidTokenize callbacks would not be called
+  # after the buffer's language mode changed, because by the time the editor
+  # called its new language mode's onDidTokenize method, the language mode
+  # would already be fully tokenized.
+  spyOn(TextEditor.prototype, "onDidTokenize").andCallFake (callback) ->
+    new CompositeDisposable(
+      @emitter.on("did-tokenize", callback),
+      @onDidChangeGrammar =>
+        languageMode = @buffer.getLanguageMode()
+        if languageMode.tokenizeInBackground?.originalValue
+          callback()
+    )
 
   clipboardContent = 'initial clipboard content'
   spyOn(clipboard, 'writeText').andCallFake (text) -> clipboardContent = text
